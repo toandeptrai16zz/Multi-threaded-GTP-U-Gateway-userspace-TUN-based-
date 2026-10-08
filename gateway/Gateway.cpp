@@ -187,6 +187,8 @@ bool parse_args(int argc, char **argv, Config &cfg) {
         else if (a == "-t" && i + 1 < argc) cfg.teid = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
         else if (a == "-p" && i + 1 < argc) cfg.port = static_cast<uint16_t>(std::strtoul(argv[++i], nullptr, 0));
         else if (a == "-v") cfg.verbose = true;
+        else if (a == "-b" && i + 1 < argc) cfg.bind_ip = argv[++i];
+        else if (a == "-r" && i + 1 < argc) cfg.peer_ip = argv[++i];
         else return false;
     }
     return true;
@@ -196,53 +198,126 @@ bool parse_args(int argc, char **argv, Config &cfg) {
 
 int main(int argc, char **argv) {
     Config cfg;
+
     if (!parse_args(argc, argv, cfg)) {
-        std::fprintf(stderr, "usage: %s [-i ifname] [-t teid] [-p port] [-v]\n", argv[0]);
+        std::fprintf(
+            stderr,
+            "usage: %s [-i ifname] [-b bind_ip] [-r peer_ip] "
+            "[-t teid] [-p port] [-v]\n",
+            argv[0]
+        );
         return EXIT_FAILURE;
     }
 
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_signal;       // khong dat SA_RESTART: poll se tra ve EINTR de thoat
+
+    sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
+
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
+    // Tao TUN
     int tun_fd = tun_open(cfg.ifname);
-    if (tun_fd < 0) return EXIT_FAILURE;
-    int udp_fd = udp_open(cfg.port);
-    if (udp_fd < 0) { close(tun_fd); return EXIT_FAILURE; }
+    if (tun_fd < 0)
+        return EXIT_FAILURE;
 
+    // Tao UDP socket va bind
+    int udp_fd = udp_open(cfg.bind_ip, cfg.port);
+    if (udp_fd < 0) {
+        close(tun_fd);
+        return EXIT_FAILURE;
+    }
+
+    // Cau hinh dia chi GTP-U peer
     struct sockaddr_in peer;
     std::memset(&peer, 0, sizeof(peer));
+
     peer.sin_family = AF_INET;
     peer.sin_port = htons(cfg.port);
-    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    std::printf("gateway: %s <-> udp/127.0.0.1:%u, TEID=%u (Ctrl+C de dung)\n",
-                cfg.ifname.c_str(), cfg.port, cfg.teid);
-    std::printf("tiep theo: sudo ip addr add 10.9.0.1/24 dev %s && sudo ip link set %s up\n",
-                cfg.ifname.c_str(), cfg.ifname.c_str());
+    if (inet_pton(AF_INET, cfg.peer_ip.c_str(), &peer.sin_addr) != 1) {
+        std::fprintf(
+            stderr,
+            "invalid peer IP: %s\n",
+            cfg.peer_ip.c_str()
+        );
+
+        close(udp_fd);
+        close(tun_fd);
+        return EXIT_FAILURE;
+    }
+
+    std::printf(
+        "gateway: %s -> %s:%u, TEID=%u (Ctrl+C de dung)\n",
+        cfg.ifname.c_str(),
+        cfg.peer_ip.c_str(),
+        cfg.port,
+        cfg.teid
+    );
+
+    std::printf(
+        "tiep theo: sudo ip addr add 10.9.0.1/24 dev %s && "
+        "sudo ip link set %s up\n",
+        cfg.ifname.c_str(),
+        cfg.ifname.c_str()
+    );
 
     std::vector<unsigned char> rx(65536 + GTPU_HEADER_SIZE);
     std::vector<unsigned char> tx(65536 + GTPU_HEADER_SIZE);
+
     Counters counters;
-    struct pollfd fds[2] = {{tun_fd, POLLIN, 0}, {udp_fd, POLLIN, 0}};
+
+    struct pollfd fds[2] = {
+        {tun_fd, POLLIN, 0},
+        {udp_fd, POLLIN, 0}
+    };
+
     auto last_stats = std::chrono::steady_clock::now();
 
     while (g_running.load()) {
+
         int rc = poll(fds, 2, 1000);
+
         if (rc < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
+
             std::perror("poll");
             break;
         }
-        if ((fds[0].revents | fds[1].revents) & POLLNVAL) break;
 
-        if (fds[0].revents & POLLIN) handle_tun(tun_fd, udp_fd, cfg, counters, rx, tx, peer);
-        if (fds[1].revents & POLLIN) handle_udp(tun_fd, udp_fd, cfg, counters, rx);
+        if ((fds[0].revents | fds[1].revents) & POLLNVAL)
+            break;
 
+        // TUN co packet
+        if (fds[0].revents & POLLIN) {
+            handle_tun(
+                tun_fd,
+                udp_fd,
+                cfg,
+                counters,
+                rx,
+                tx,
+                peer
+            );
+        }
+
+        // UDP GTP-U co packet
+        if (fds[1].revents & POLLIN) {
+            handle_udp(
+                tun_fd,
+                udp_fd,
+                cfg,
+                counters,
+                rx
+            );
+        }
+
+        // In statistics moi 2 giay
         auto now = std::chrono::steady_clock::now();
+
         if (now - last_stats >= std::chrono::seconds(2)) {
             print_stats(counters);
             last_stats = now;
@@ -250,8 +325,11 @@ int main(int argc, char **argv) {
     }
 
     print_stats(counters);
+
     close(udp_fd);
     close(tun_fd);
+
     std::puts("gateway: da dung");
+
     return EXIT_SUCCESS;
 }
